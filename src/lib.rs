@@ -538,6 +538,15 @@ pub trait Filesystem: Send + Sync + 'static {
     /// Called on filesystem exit.
     fn destroy(&mut self) {}
 
+    /// Finish work that must complete before acknowledging `FUSE_DESTROY`.
+    ///
+    /// Unlike [`Self::destroy`], this runs before replying to the kernel,
+    /// while a block-backed mount still owns its device. Filesystems can
+    /// publish pending changes here before unmount releases that claim.
+    /// This does not run when the connection aborts without `FUSE_DESTROY`.
+    /// Cleanup still belongs in `destroy`, after the session threads end.
+    fn before_destroy(&self) {}
+
     /// Look up a directory entry by name and get its attributes.
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         warn!("[Not Implemented] lookup(parent: {parent:#x?}, name {name:?})");
