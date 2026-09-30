@@ -725,6 +725,11 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
                         // Dispatch request
                         Some(req) => {
                             if let Ok(Operation::Destroy(_)) = req.request.operation() {
+                                self.filesystem
+                                    .fs
+                                    .as_ref()
+                                    .expect("filesystem exists until the session ends")
+                                    .before_destroy();
                                 req.reply::<ReplyEmpty>().ok();
                                 return Ok(());
                             } else {
@@ -876,6 +881,68 @@ pub(crate) mod test {
     use crate::InitFlags;
     use crate::KernelConfig;
     use crate::Request;
+
+    #[test]
+    fn destroy_reply_waits_for_before_destroy() {
+        use std::os::unix::net::UnixDatagram;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        struct PendingFs {
+            entered: mpsc::Sender<()>,
+            resume: Mutex<mpsc::Receiver<()>>,
+        }
+        impl Filesystem for PendingFs {
+            fn before_destroy(&self) {
+                self.entered.send(()).unwrap();
+                self.resume.lock().recv().unwrap();
+            }
+        }
+
+        let (client, server) = UnixDatagram::pair().unwrap();
+        let (entered, waiting) = mpsc::channel();
+        let (resume, resumed) = mpsc::channel();
+        let event_loop = SessionEventLoop {
+            thread_name: "destroy-test".into(),
+            ch: Channel::new(Arc::new(DevFuse(File::from(OwnedFd::from(server))))),
+            filesystem: Arc::new(FilesystemHolder {
+                fs: Some(PendingFs {
+                    entered,
+                    resume: Mutex::new(resumed),
+                }),
+            }),
+            allowed: SessionACL::All,
+            session_owner: geteuid(),
+            negotiated: InitFlags::empty(),
+            kernel_capabilities: InitFlags::empty(),
+            kernel_abi: None,
+        };
+        let runner = thread::spawn(move || event_loop.event_loop());
+        let mut request = [0u8; 40];
+        request[..4].copy_from_slice(&40u32.to_ne_bytes());
+        request[4..8].copy_from_slice(&(abi::fuse_opcode::FUSE_DESTROY as u32).to_ne_bytes());
+        request[8..16].copy_from_slice(&1u64.to_ne_bytes());
+        client.send(&request).unwrap();
+        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let mut reply = [0u8; 16];
+        let error = client.recv(&mut reply).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ));
+        resume.send(()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        assert_eq!(client.recv(&mut reply).unwrap(), 16);
+        assert_eq!(&reply[..4], &16u32.to_ne_bytes());
+        assert_eq!(&reply[4..8], &0i32.to_ne_bytes());
+        assert_eq!(&reply[8..], &1u64.to_ne_bytes());
+        runner.join().unwrap().unwrap();
+    }
 
     /// A filesystem that requests FUSE_ABORT_ERROR during init, so that after an
     /// abort the FUSE device fails reads with ECONNABORTED instead of ENODEV.
