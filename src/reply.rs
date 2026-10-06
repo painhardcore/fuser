@@ -507,9 +507,28 @@ impl ReplyCreate {
         fh: ll::FileHandle,
         flags: FopenFlags,
     ) {
+        self.created_with_ttls(ttl, ttl, attr, generation, fh, flags);
+    }
+
+    /// Reply to a request with a newly created file entry and its newly open file handle.
+    ///
+    /// Use this function instead of `ReplyCreate::created` if the entry TTL needs to be
+    /// different from the attribute TTL, as with [`ReplyEntry::entry_with_ttls()`].
+    /// # Panics
+    /// When attempting to use kernel passthrough. Use `opened_passthrough()` instead.
+    pub fn created_with_ttls(
+        self,
+        attr_ttl: &Duration,
+        entry_ttl: &Duration,
+        attr: &FileAttr,
+        generation: Generation,
+        fh: ll::FileHandle,
+        flags: FopenFlags,
+    ) {
         assert!(!flags.contains(FopenFlags::FOPEN_PASSTHROUGH));
         self.reply.send_ll(&ll::ResponseStruct::new_create(
-            ttl,
+            attr_ttl,
+            entry_ttl,
             &attr.into(),
             generation,
             fh,
@@ -562,6 +581,7 @@ impl ReplyCreate {
         backing_id: &BackingId,
     ) {
         self.reply.send_ll(&ll::ResponseStruct::new_create(
+            ttl,
             ttl,
             &attr.into(),
             generation,
@@ -792,15 +812,33 @@ impl ReplyDirectoryPlus {
         attr: &FileAttr,
         generation: Generation,
     ) -> bool {
+        self.add_with_ttls(ino, offset, name, ttl, ttl, attr, generation)
+    }
+
+    /// Add an entry to the directory reply buffer. Returns true if the buffer is full.
+    ///
+    /// Use this function instead of `ReplyDirectoryPlus::add` if the entry TTL needs to be
+    /// different from the attribute TTL, as with [`ReplyEntry::entry_with_ttls()`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_with_ttls<T: AsRef<OsStr>>(
+        &mut self,
+        ino: INodeNo,
+        offset: u64,
+        name: T,
+        attr_ttl: &Duration,
+        entry_ttl: &Duration,
+        attr: &FileAttr,
+        generation: Generation,
+    ) -> bool {
         let name = name.as_ref();
         self.buf.push(&DirEntryPlus::new(
             ino,
             generation,
             DirEntOffset(offset),
             name,
-            *ttl,
+            *entry_ttl,
             attr.into(),
-            *ttl,
+            *attr_ttl,
         ))
     }
 
@@ -1293,6 +1331,95 @@ mod test {
         // in what remained
         assert!(added > 0 && added < 100);
         assert!(before_full < 256);
+        reply.ok();
+    }
+
+    fn ioslices_to_vec(slices: &[std::io::IoSlice<'_>]) -> Vec<u8> {
+        slices
+            .iter()
+            .flat_map(|slice| slice.iter().copied())
+            .collect()
+    }
+
+    fn ttl_test_attr() -> FileAttr {
+        FileAttr {
+            ino: INodeNo(1),
+            size: 0,
+            blocks: 0,
+            atime: UNIX_EPOCH,
+            mtime: UNIX_EPOCH,
+            ctime: UNIX_EPOCH,
+            crtime: UNIX_EPOCH,
+            kind: FileType::RegularFile,
+            perm: 0o644,
+            nlink: 1,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            flags: 0,
+            blksize: 512,
+        }
+    }
+
+    #[test]
+    fn reply_create_with_ttls() {
+        let (attr_ttl, entry_ttl) = (Duration::new(0x11, 0x22), Duration::new(0x33, 0x44));
+        let attr = ttl_test_attr();
+        let expected = ll::ResponseStruct::new_create(
+            &attr_ttl,
+            &entry_ttl,
+            &(&attr).into(),
+            ll::Generation(0),
+            ll::FileHandle(0xbb),
+            FopenFlags::empty(),
+            0,
+        )
+        .with_iovec(ll::RequestId(0xdeadbeef), ioslices_to_vec);
+        // fuse_out_header, then fuse_entry_out: nodeid, generation, entry_valid,
+        // attr_valid, entry_valid_nsec, attr_valid_nsec
+        assert_eq!(expected[32..40], 0x33u64.to_ne_bytes());
+        assert_eq!(expected[40..48], 0x11u64.to_ne_bytes());
+        assert_eq!(expected[48..52], 0x44u32.to_ne_bytes());
+        assert_eq!(expected[52..56], 0x22u32.to_ne_bytes());
+        let sender = ReplySender::Assert(AssertSender { expected });
+        let reply: ReplyCreate = Reply::new(ll::RequestId(0xdeadbeef), sender);
+        reply.created_with_ttls(
+            &attr_ttl,
+            &entry_ttl,
+            &attr,
+            ll::Generation(0),
+            ll::FileHandle(0xbb),
+            FopenFlags::empty(),
+        );
+    }
+
+    #[test]
+    fn reply_directory_plus_with_ttls() {
+        let (attr_ttl, entry_ttl) = (Duration::new(0x11, 0x22), Duration::new(0x33, 0x44));
+        let attr = ttl_test_attr();
+        let mut list = DirEntPlusList::new(4096);
+        assert!(!list.push(&DirEntryPlus::new(
+            INodeNo(1),
+            ll::Generation(0),
+            DirEntOffset(1),
+            "hello",
+            entry_ttl,
+            (&attr).into(),
+            attr_ttl,
+        )));
+        let expected =
+            ll::ResponseData::from(list).with_iovec(ll::RequestId(0xdeadbeef), ioslices_to_vec);
+        let sender = ReplySender::Assert(AssertSender { expected });
+        let mut reply = ReplyDirectoryPlus::new(ll::RequestId(0xdeadbeef), sender, 4096);
+        assert!(!reply.add_with_ttls(
+            INodeNo(1),
+            1,
+            "hello",
+            &attr_ttl,
+            &entry_ttl,
+            &attr,
+            ll::Generation(0)
+        ));
         reply.ok();
     }
 
