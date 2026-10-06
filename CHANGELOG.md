@@ -167,6 +167,9 @@
   requests those operations
 * Remove the `macfuse-4-compat` feature flag, which was set by the build script and selected the
   extended `fuse_rename_in` layout. That layout is now used for all macOS builds
+* Add `ReplyCreate::created_with_ttls()` and `ReplyDirectoryPlus::add_with_ttls()` to reply with
+  distinct entry and attribute TTLs, as `ReplyEntry::entry_with_ttls()` does for lookups. Names
+  learned from `create()` and `readdirplus()` can now outlive their attributes
 
 ## 0.18.0 - 2026-07-22
 * Remove deprecated feature flags `abi-*`
