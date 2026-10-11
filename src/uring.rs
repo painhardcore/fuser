@@ -869,6 +869,11 @@ impl Queue {
                 // answered with EIO as its reply is dropped
                 let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     if opcode == abi::fuse_opcode::FUSE_DESTROY as u32 {
+                        // As on /dev/fuse, the filesystem finishes its work before the reply
+                        // lets a block-backed mount release its device
+                        if let Some(fs) = &se.filesystem.fs {
+                            fs.before_destroy();
+                        }
                         // The connection is going away; nothing is torn down until it has
                         request.reply::<crate::ReplyEmpty>().ok();
                     } else {
