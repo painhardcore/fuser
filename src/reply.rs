@@ -39,6 +39,9 @@ use crate::passthrough::BackingId;
 #[derive(Debug)]
 pub(crate) enum ReplySender {
     Channel(ChannelSender),
+    /// Into the buffers of the io_uring queue entry the request arrived in
+    #[cfg(target_os = "linux")]
+    Uring(crate::uring::Replier),
     #[cfg(test)]
     Assert(AssertSender),
     #[cfg(test)]
@@ -50,6 +53,8 @@ impl ReplySender {
     pub(crate) fn send(&self, data: &[IoSlice<'_>]) -> std::io::Result<()> {
         match self {
             ReplySender::Channel(sender) => sender.send(data),
+            #[cfg(target_os = "linux")]
+            ReplySender::Uring(replier) => replier.send(data),
             #[cfg(test)]
             ReplySender::Assert(sender) => sender.send(data),
             #[cfg(test)]
@@ -60,10 +65,51 @@ impl ReplySender {
         }
     }
 
+    /// Send a data reply whose payload `fill` writes into a buffer of `size` bytes, returning
+    /// how many it wrote. The buffer is the one the kernel reads the reply from, where the
+    /// transport has one
+    pub(crate) fn send_filled(
+        &self,
+        unique: ll::RequestId,
+        size: usize,
+        fill: impl FnOnce(&mut [u8]) -> Result<usize, Errno>,
+    ) -> std::io::Result<()> {
+        #[cfg(target_os = "linux")]
+        if let ReplySender::Uring(replier) = self {
+            return replier.send_filled(unique.0, size, fill);
+        }
+        thread_local! {
+            /// Kept between replies, as filling one is how a large read is answered
+            static BUFFER: std::cell::Cell<Vec<u8>> = const { std::cell::Cell::new(Vec::new()) };
+        }
+        // Taken rather than borrowed, so that a reply sent from within `fill` finds a buffer
+        let mut buffer = BUFFER.take();
+        if buffer.len() < size {
+            buffer.resize(size, 0);
+        }
+        let result = match fill(&mut buffer[..size]) {
+            Ok(n) if n <= size => {
+                ll::ResponseSlice(&buffer[..n]).with_iovec(unique, |iov| self.send(iov))
+            }
+            Ok(n) => {
+                error!("Filled {n} bytes of a {size} byte reply");
+                ll::ResponseErrno(Errno::EIO).with_iovec(unique, |iov| self.send(iov))
+            }
+            Err(err) => ll::ResponseErrno(err).with_iovec(unique, |iov| self.send(iov)),
+        };
+        // A buffer grown for an unusually large reply is not worth keeping
+        if buffer.capacity() <= 4 << 20 {
+            BUFFER.set(buffer);
+        }
+        result
+    }
+
     /// Open a backing file
     pub(crate) fn open_backing(&self, fd: BorrowedFd<'_>) -> std::io::Result<BackingId> {
         match self {
             ReplySender::Channel(sender) => sender.open_backing(fd),
+            #[cfg(target_os = "linux")]
+            ReplySender::Uring(replier) => replier.channel().open_backing(fd),
             #[cfg(test)]
             ReplySender::Assert(_) => unreachable!(),
             #[cfg(test)]
@@ -75,6 +121,8 @@ impl ReplySender {
     pub(crate) unsafe fn wrap_backing(&self, id: u32) -> BackingId {
         match self {
             ReplySender::Channel(sender) => unsafe { sender.wrap_backing(id) },
+            #[cfg(target_os = "linux")]
+            ReplySender::Uring(replier) => unsafe { replier.channel().wrap_backing(id) },
             #[cfg(test)]
             ReplySender::Assert(_) => unreachable!(),
             #[cfg(test)]
@@ -140,6 +188,25 @@ impl ReplyRaw {
     }
     pub(crate) fn send_ll(mut self, response: &impl Response) {
         self.send_ll_mut(response);
+    }
+
+    /// Reply with data written by `fill`, see [`ReplySender::send_filled`]
+    pub(crate) fn send_filled(
+        mut self,
+        size: usize,
+        fill: impl FnOnce(&mut [u8]) -> Result<usize, Errno>,
+    ) {
+        // The sender stays in place until the reply is sent, so that a panic in `fill` still
+        // answers the request when this is dropped
+        let res =
+            self.sender
+                .as_ref()
+                .expect("reply sent once")
+                .send_filled(self.unique, size, fill);
+        self.sender = None;
+        if let Err(err) = res {
+            error!("Failed to send FUSE reply: {err}");
+        }
     }
 
     /// Reply to a request with the given error code
@@ -208,6 +275,27 @@ impl ReplyData {
     /// Reply to a request with the given data
     pub fn data(self, data: &[u8]) {
         self.reply.send_ll(&ll::ResponseSlice(data));
+    }
+
+    /// Reply with data written straight into the reply buffer. `fill` is given a buffer of
+    /// `size` bytes and returns how many of them it filled, or an error to reply with instead.
+    ///
+    /// Over io_uring the buffer is the one the kernel copies the reply from, which saves
+    /// copying the data once compared to [`ReplyData::data`]; for a large read that is most of
+    /// the cost of the reply. Over `/dev/fuse` it is a buffer kept for the thread, so this
+    /// costs the same as `data`.
+    ///
+    /// ```no_run
+    /// # use std::os::unix::fs::FileExt;
+    /// # fn read(file: &std::fs::File, offset: u64, size: u32, reply: fuser::ReplyData) {
+    /// reply.fill(size as usize, |buf| {
+    ///     file.read_at(buf, offset)
+    ///         .map_err(|err| fuser::Errno::from_i32(err.raw_os_error().unwrap_or(libc::EIO)))
+    /// });
+    /// # }
+    /// ```
+    pub fn fill(self, size: usize, fill: impl FnOnce(&mut [u8]) -> Result<usize, Errno>) {
+        self.reply.send_filled(size, fill);
     }
 
     /// Reply to a request with the given error code
@@ -1002,6 +1090,62 @@ mod test {
         });
         let reply: ReplyData = Reply::new(ll::RequestId(0xdeadbeef), sender);
         reply.data(&[0xde, 0xad, 0xbe, 0xef]);
+    }
+
+    #[test]
+    fn reply_fill() {
+        let sender = ReplySender::Assert(AssertSender {
+            expected: vec![
+                0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xef, 0xbe, 0xad, 0xde, 0x00, 0x00,
+                0x00, 0x00, 0xde, 0xad, 0xbe, 0xef,
+            ],
+        });
+        let reply: ReplyData = Reply::new(ll::RequestId(0xdeadbeef), sender);
+        reply.fill(8, |buf| {
+            assert_eq!(buf.len(), 8);
+            buf[..4].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+            Ok(4)
+        });
+    }
+
+    /// The bytes of an error reply to request 0xdeadbeef
+    fn error_reply(errno: i32) -> Vec<u8> {
+        let mut expected = vec![0x10, 0x00, 0x00, 0x00];
+        expected.extend_from_slice(&(-errno).to_le_bytes());
+        expected.extend_from_slice(&[0xef, 0xbe, 0xad, 0xde, 0x00, 0x00, 0x00, 0x00]);
+        expected
+    }
+
+    #[test]
+    fn reply_fill_error() {
+        let sender = ReplySender::Assert(AssertSender {
+            expected: error_reply(66),
+        });
+        let reply: ReplyData = Reply::new(ll::RequestId(0xdeadbeef), sender);
+        reply.fill(8, |_| Err(Errno::from_i32(66)));
+    }
+
+    /// Claiming more than the buffer held is answered with EIO, not with what lies beyond it
+    #[test]
+    fn reply_fill_overrun() {
+        let sender = ReplySender::Assert(AssertSender {
+            expected: error_reply(libc::EIO),
+        });
+        let reply: ReplyData = Reply::new(ll::RequestId(0xdeadbeef), sender);
+        reply.fill(8, |_| Ok(9));
+    }
+
+    /// A panic while filling still answers the request
+    #[test]
+    fn reply_fill_panic() {
+        let sender = ReplySender::Assert(AssertSender {
+            expected: error_reply(libc::EIO),
+        });
+        let reply: ReplyData = Reply::new(ll::RequestId(0xdeadbeef), sender);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            reply.fill(8, |_| panic!("deliberate panic while filling a reply"))
+        }));
+        assert!(panicked.is_err());
     }
 
     #[test]

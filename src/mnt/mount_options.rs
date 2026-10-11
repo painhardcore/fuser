@@ -18,6 +18,62 @@ pub struct Config {
     /// This enables more efficient request processing
     /// when multiple threads are used. Requires Linux 4.5+.
     pub clone_fd: bool,
+    /// Whether to serve requests over FUSE's io_uring transport. Off by default.
+    pub io_uring: IoUringConfig,
+}
+
+/// Whether a session serves requests over io_uring rather than by reading `/dev/fuse`
+///
+/// FUSE over io_uring needs Linux 6.14 or later with the `fuse` module's `enable_uring`
+/// parameter set, and a process that may use io_uring at all, which seccomp profiles and the
+/// `kernel.io_uring_disabled` sysctl can forbid.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Hash)]
+#[non_exhaustive]
+pub enum IoUringMode {
+    /// Read requests from `/dev/fuse`
+    #[default]
+    Disabled,
+    /// Use io_uring where the kernel and the process allow it, and `/dev/fuse` otherwise
+    Auto,
+    /// Use io_uring, and fail to mount where it cannot be used
+    Required,
+}
+
+/// How a session uses FUSE over io_uring
+///
+/// The kernel has one queue per possible CPU and hands each request to the queue of the CPU it
+/// was issued on. A session serving it runs one thread per queue, pinned to that CPU where the
+/// process may run there, and the filesystem is called from those threads. Requests issued on
+/// a CPU are served one at a time while its thread is busy, so a filesystem method that blocks
+/// for long delays every other request from that CPU; replying from another thread avoids that.
+///
+/// Every queue entry holds a buffer the size of the largest request, which is
+/// `KernelConfig::set_max_write()` (16 MiB unless lowered) or the readahead size, whichever is
+/// larger. It is reserved up front but only takes memory once a request that size arrives.
+///
+/// `FORGET` and `INTERRUPT` still arrive on `/dev/fuse`, so `Config::n_threads` keeps serving
+/// it alongside the queues.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+#[non_exhaustive]
+pub struct IoUringConfig {
+    /// Whether to use io_uring
+    pub mode: IoUringMode,
+    /// Requests each queue can hold at once, from 1 to 1024
+    pub queue_depth: u16,
+}
+
+impl IoUringConfig {
+    /// Largest accepted `queue_depth`
+    pub const MAX_QUEUE_DEPTH: u16 = 1024;
+}
+
+impl Default for IoUringConfig {
+    fn default() -> Self {
+        Self {
+            mode: IoUringMode::Disabled,
+            queue_depth: 8,
+        }
+    }
 }
 
 /// Mount options accepted by the FUSE filesystem type
@@ -114,6 +170,7 @@ pub(crate) enum MountOptionGroup {
 }
 
 pub(crate) fn check_option_conflicts(options: &Config) -> Result<(), io::Error> {
+    check_io_uring(&options.io_uring)?;
     let mut options_set = HashSet::new();
     options_set.extend(options.mount_options.iter().cloned());
     let conflicting: HashSet<MountOption> = options
@@ -130,6 +187,22 @@ pub(crate) fn check_option_conflicts(options: &Config) -> Result<(), io::Error> 
             format!("Conflicting mount options found: {intersection:?}"),
         ))
     }
+}
+
+pub(crate) fn check_io_uring(config: &IoUringConfig) -> Result<(), io::Error> {
+    if config.mode != IoUringMode::Disabled
+        && !(1..=IoUringConfig::MAX_QUEUE_DEPTH).contains(&config.queue_depth)
+    {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "io_uring queue_depth must be from 1 to {}, got {}",
+                IoUringConfig::MAX_QUEUE_DEPTH,
+                config.queue_depth
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Option values reach the kernel, libfuse, or a fusermount helper inside a comma

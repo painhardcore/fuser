@@ -50,6 +50,8 @@ pub use crate::ll::request::INodeNo;
 pub use crate::ll::request::LockOwner;
 pub use crate::ll::request::Version;
 pub use crate::mnt::mount_options::Config;
+pub use crate::mnt::mount_options::IoUringConfig;
+pub use crate::mnt::mount_options::IoUringMode;
 pub use crate::mnt::mount_options::MountOption;
 pub use crate::notify::Notifier;
 pub use crate::notify::PollHandle;
@@ -105,6 +107,8 @@ mod request;
 mod request_param;
 mod session;
 mod time;
+#[cfg(target_os = "linux")]
+mod uring;
 
 /// We generally support async reads
 #[cfg(not(target_os = "macos"))]
@@ -157,7 +161,8 @@ const UNSUPPORTED_CAPABILITIES: InitFlags = ALIASED_UNSUPPORTED_CAPABILITIES
     // Selecting DAX per inode requires FUSE_ATTR_DAX in the flags field of fuse_attr, which
     // fuser sends as padding. Only a DAX-capable transport (virtiofs) advertises this
     .union(InitFlags::FUSE_HAS_INODE_DAX)
-    // The kernel would route requests to io_uring queues that fuser never creates
+    // The session negotiates this from `Config::io_uring`, since it is the session that has to
+    // serve the queues the kernel then routes requests to
     .union(InitFlags::FUSE_OVER_IO_URING)
     // Announces that the filesystem copes with requests the kernel resends. fuser cannot send
     // the FUSE_NOTIFY_RESEND notification that asks for a resend in the first place

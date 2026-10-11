@@ -200,7 +200,7 @@ echo "generic/208" >> xfs_excludes.txt
 echo "generic/323" >> xfs_excludes.txt
 
 
-FUSER_EXTRA_MOUNT_OPTIONS="--auto-unmount --dev" TEST_DEV="$TEST_DATA_DIR" TEST_DIR="$TEST_DIR" SCRATCH_DEV="$SCRATCH_DATA_DIR" SCRATCH_MNT="$SCRATCH_DIR" \
+FUSER_EXTRA_MOUNT_OPTIONS="--auto-unmount --dev ${FUSER_EXTRA_ARGS:-}" TEST_DEV="$TEST_DATA_DIR" TEST_DIR="$TEST_DIR" SCRATCH_DEV="$SCRATCH_DATA_DIR" SCRATCH_MNT="$SCRATCH_DIR" \
 ./check-fuser -E xfs_excludes.txt "$@" \
 | tee /code/logs/xfstests.log
 

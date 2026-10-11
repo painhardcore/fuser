@@ -743,7 +743,7 @@ pub(crate) struct fuse_in_header {
 }
 
 #[repr(C)]
-#[derive(Debug, IntoBytes, KnownLayout, Immutable)]
+#[derive(Debug, FromBytes, IntoBytes, KnownLayout, Immutable)]
 pub(crate) struct fuse_out_header {
     pub(crate) len: u32,
     pub(crate) error: i32,
@@ -862,4 +862,125 @@ pub(crate) struct fuse_copy_file_range_in {
     pub(crate) off_out: i64,
     pub(crate) len: u64,
     pub(crate) flags: u64,
+}
+
+/// Size of `fuse_uring_req_header::in_out`, which holds a `fuse_in_header` on the way in and a
+/// `fuse_out_header` on the way out (ABI 7.42)
+pub(crate) const FUSE_URING_IN_OUT_HEADER_SZ: usize = 128;
+/// Size of `fuse_uring_req_header::op_in`, which holds an opcode's fixed-size argument
+pub(crate) const FUSE_URING_OP_IN_OUT_SZ: usize = 128;
+
+/// Register a ring entry's buffers and wait for a request to arrive in them
+#[cfg(target_os = "linux")]
+pub(crate) const FUSE_IO_URING_CMD_REGISTER: u32 = 1;
+/// Commit the reply in a ring entry's buffers and wait for its next request
+#[cfg(target_os = "linux")]
+pub(crate) const FUSE_IO_URING_CMD_COMMIT_AND_FETCH: u32 = 2;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
+pub(crate) struct fuse_uring_ent_in_out {
+    pub(crate) flags: u64,
+    /// Identifies the request in the commit of its reply
+    pub(crate) commit_id: u64,
+    /// Bytes of the payload buffer in use: the request's on the way in, the reply's on the way out
+    pub(crate) payload_sz: u32,
+    pub(crate) padding: u32,
+    pub(crate) reserved: u64,
+}
+
+/// The first of a ring entry's two buffers. The second holds the payload
+#[repr(C)]
+#[derive(Debug, FromBytes, IntoBytes, KnownLayout, Immutable)]
+pub(crate) struct fuse_uring_req_header {
+    pub(crate) in_out: [u8; FUSE_URING_IN_OUT_HEADER_SZ],
+    pub(crate) op_in: [u8; FUSE_URING_OP_IN_OUT_SZ],
+    pub(crate) ring_ent_in_out: fuse_uring_ent_in_out,
+}
+
+/// Carried in the command area of a 128-byte submission queue entry
+#[repr(C)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
+pub(crate) struct fuse_uring_cmd_req {
+    pub(crate) flags: u64,
+    pub(crate) commit_id: u64,
+    pub(crate) qid: u16,
+    pub(crate) padding: [u8; 6],
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod test {
+    use std::mem::offset_of;
+
+    use super::*;
+
+    #[test]
+    fn uring_layouts_match_the_kernel() {
+        assert_eq!(size_of::<fuse_uring_ent_in_out>(), 32);
+        assert_eq!(offset_of!(fuse_uring_ent_in_out, commit_id), 8);
+        assert_eq!(offset_of!(fuse_uring_ent_in_out, payload_sz), 16);
+        assert_eq!(offset_of!(fuse_uring_ent_in_out, reserved), 24);
+
+        assert_eq!(size_of::<fuse_uring_req_header>(), 288);
+        assert_eq!(offset_of!(fuse_uring_req_header, in_out), 0);
+        assert_eq!(offset_of!(fuse_uring_req_header, op_in), 128);
+        assert_eq!(offset_of!(fuse_uring_req_header, ring_ent_in_out), 256);
+
+        assert_eq!(size_of::<fuse_uring_cmd_req>(), 24);
+        assert_eq!(offset_of!(fuse_uring_cmd_req, commit_id), 8);
+        assert_eq!(offset_of!(fuse_uring_cmd_req, qid), 16);
+    }
+
+    /// Over io_uring an opcode's fixed argument arrives in `op_in` and is put back in front of
+    /// the payload where it lies, which needs it to fit there and to keep the payload aligned.
+    /// Every argument the kernel sends first belongs in this list
+    #[test]
+    fn fixed_arguments_fit_op_in() {
+        assert!(size_of::<fuse_in_header>() <= FUSE_URING_IN_OUT_HEADER_SZ);
+        assert!(size_of::<fuse_out_header>() <= FUSE_URING_IN_OUT_HEADER_SZ);
+        let sizes = [
+            ("fuse_in_header", size_of::<fuse_in_header>()),
+            ("fuse_forget_in", size_of::<fuse_forget_in>()),
+            ("fuse_batch_forget_in", size_of::<fuse_batch_forget_in>()),
+            ("fuse_getattr_in", size_of::<fuse_getattr_in>()),
+            ("fuse_setattr_in", size_of::<fuse_setattr_in>()),
+            ("fuse_mknod_in", size_of::<fuse_mknod_in>()),
+            ("fuse_mkdir_in", size_of::<fuse_mkdir_in>()),
+            ("fuse_rename_in", size_of::<fuse_rename_in>()),
+            ("fuse_rename2_in", size_of::<fuse_rename2_in>()),
+            ("fuse_link_in", size_of::<fuse_link_in>()),
+            ("fuse_open_in", size_of::<fuse_open_in>()),
+            ("fuse_create_in", size_of::<fuse_create_in>()),
+            ("fuse_release_in", size_of::<fuse_release_in>()),
+            ("fuse_flush_in", size_of::<fuse_flush_in>()),
+            ("fuse_read_in", size_of::<fuse_read_in>()),
+            ("fuse_write_in", size_of::<fuse_write_in>()),
+            ("fuse_fsync_in", size_of::<fuse_fsync_in>()),
+            ("fuse_setxattr_in", size_of::<fuse_setxattr_in>()),
+            ("fuse_setxattr_in_ext", size_of::<fuse_setxattr_in_ext>()),
+            ("fuse_getxattr_in", size_of::<fuse_getxattr_in>()),
+            ("fuse_lk_in", size_of::<fuse_lk_in>()),
+            ("fuse_access_in", size_of::<fuse_access_in>()),
+            ("fuse_interrupt_in", size_of::<fuse_interrupt_in>()),
+            ("fuse_bmap_in", size_of::<fuse_bmap_in>()),
+            ("fuse_ioctl_in", size_of::<fuse_ioctl_in>()),
+            ("fuse_poll_in", size_of::<fuse_poll_in>()),
+            ("fuse_fallocate_in", size_of::<fuse_fallocate_in>()),
+            ("fuse_lseek_in", size_of::<fuse_lseek_in>()),
+            (
+                "fuse_copy_file_range_in",
+                size_of::<fuse_copy_file_range_in>(),
+            ),
+            ("fuse_syncfs_in", size_of::<fuse_syncfs_in>()),
+            ("fuse_statx_in", size_of::<fuse_statx_in>()),
+            (
+                "fuse_notify_retrieve_in",
+                size_of::<fuse_notify_retrieve_in>(),
+            ),
+        ];
+        for (name, size) in sizes {
+            assert_eq!(size % 8, 0, "{name} is {size} bytes");
+            assert!(size <= FUSE_URING_OP_IN_OUT_SZ, "{name} is {size} bytes");
+        }
+    }
 }

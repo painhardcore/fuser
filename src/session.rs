@@ -151,6 +151,9 @@ pub struct Session<FS: Filesystem> {
     /// not `negotiated`, says whether the kernel can perform them
     pub(crate) kernel_capabilities: InitFlags,
     pub(crate) config: Config,
+    /// How to set up the io_uring queues, when `FUSE_OVER_IO_URING` was negotiated
+    #[cfg(target_os = "linux")]
+    pub(crate) io_uring: Option<crate::uring::QueueParams>,
 }
 
 impl<FS: Filesystem> AsFd for Session<FS> {
@@ -200,6 +203,8 @@ impl<FS: Filesystem> Session<FS> {
             negotiated: InitFlags::empty(),
             kernel_capabilities: InitFlags::empty(),
             config: options.clone(),
+            #[cfg(target_os = "linux")]
+            io_uring: None,
         };
 
         session.handshake()?;
@@ -230,6 +235,8 @@ impl<FS: Filesystem> Session<FS> {
             negotiated: InitFlags::empty(),
             kernel_capabilities: InitFlags::empty(),
             config,
+            #[cfg(target_os = "linux")]
+            io_uring: None,
         };
 
         session.handshake()?;
@@ -262,9 +269,10 @@ impl<FS: Filesystem> Session<FS> {
     }
 
     /// Run the session loop that receives kernel requests and dispatches them to method
-    /// calls into the filesystem. This read-dispatch-loop is non-concurrent to prevent
-    /// having multiple buffers (which take up much memory), but the filesystem methods
-    /// may run concurrent by spawning threads.
+    /// calls into the filesystem. Unless `Config::n_threads` asks for more, `/dev/fuse` is
+    /// read by a single thread, to prevent having multiple buffers (which take up much
+    /// memory), but the filesystem methods may run concurrent by spawning threads. With FUSE
+    /// over io_uring in use, each of its queues is served by a thread of its own as well.
     /// # Errors
     /// Returns any final error when the session comes to an end.
     pub fn run(self) -> io::Result<()> {
@@ -278,6 +286,8 @@ impl<FS: Filesystem> Session<FS> {
             negotiated,
             kernel_capabilities,
             config,
+            #[cfg(target_os = "linux")]
+            io_uring,
         } = self;
 
         let n_threads = config.n_threads.unwrap_or(1);
@@ -294,6 +304,47 @@ impl<FS: Filesystem> Session<FS> {
         };
 
         let mut filesystem = Arc::new(filesystem);
+
+        // The kernel holds requests back until every queue is registered, so the queues come
+        // up before anything else
+        #[cfg(target_os = "linux")]
+        let queues = match io_uring {
+            None => None,
+            Some(params) => {
+                let loops = (0..params.queues)
+                    .map(|qid| SessionEventLoop {
+                        thread_name: format!("fuser-uring-{qid}"),
+                        filesystem: filesystem.clone(),
+                        ch: ch.clone(),
+                        allowed,
+                        session_owner,
+                        negotiated,
+                        kernel_capabilities,
+                        kernel_abi: proto_version,
+                    })
+                    .collect();
+                match crate::uring::Queues::start(params, &ch.device(), loops) {
+                    Ok(queues) => {
+                        info!(
+                            "Serving requests over io_uring: {} queues of depth {}",
+                            params.queues, params.depth
+                        );
+                        Some(queues)
+                    }
+                    Err(err) => {
+                        // Nothing would serve the requests the kernel is holding for the queues
+                        if let Err(disable_err) = crate::uring::disable_in_kernel(&ch.device()) {
+                            error!("Failed to turn io_uring off for the connection: {disable_err}");
+                        }
+                        if config.io_uring.mode == crate::IoUringMode::Required {
+                            return Err(err);
+                        }
+                        warn!("Serving requests over /dev/fuse, as io_uring failed: {err}");
+                        None
+                    }
+                }
+            }
+        };
 
         let mut channels = Vec::with_capacity(n_threads);
 
@@ -336,18 +387,31 @@ impl<FS: Filesystem> Session<FS> {
         }
 
         let mut reply: io::Result<()> = Ok(());
+        let mut panicked = false;
         for thread in threads {
-            let res = match thread.join() {
-                Ok(res) => res,
-                Err(_) => {
-                    return Err(io::Error::other("event loop thread panicked"));
+            match thread.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    if reply.is_ok() {
+                        reply = Err(e);
+                    }
                 }
-            };
-            if let Err(e) = res {
-                if reply.is_ok() {
-                    reply = Err(e);
-                }
+                Err(_) => panicked = true,
             }
+        }
+
+        // The connection has ended, or the session has failed and is about to end it, so
+        // whatever the queues are still waiting for will not come
+        #[cfg(target_os = "linux")]
+        if let Some(queues) = queues {
+            if let Err(e) = queues.stop_and_join() {
+                error!("{e}");
+                panicked = true;
+            }
+        }
+
+        if panicked {
+            return Err(io::Error::other("event loop thread panicked"));
         }
 
         let Some(filesystem) = Arc::get_mut(&mut filesystem) else {
@@ -362,6 +426,7 @@ impl<FS: Filesystem> Session<FS> {
     }
 
     fn handshake(&mut self) -> io::Result<()> {
+        crate::mnt::mount_options::check_io_uring(&self.config.io_uring)?;
         let mut buf = FuseReadBuf::new();
         let buf = buf.as_mut();
 
@@ -466,6 +531,12 @@ impl<FS: Filesystem> Session<FS> {
                 return Err(error);
             }
 
+            if let Err(err) = self.negotiate_io_uring(init.capabilities(), &mut config) {
+                <ReplyRaw as Reply>::new(request.unique(), ReplySender::Channel(self.ch.sender()))
+                    .send_ll(&ResponseErrno(ll::Errno::EPROTO));
+                return Err(err);
+            }
+
             // Remember the ABI version supported by kernel and mark the session initialized.
             self.proto_version = Some(v);
             self.negotiated = init.capabilities() & config.requested;
@@ -516,6 +587,56 @@ impl<FS: Filesystem> Session<FS> {
         }
     }
 
+    /// Requests `FUSE_OVER_IO_URING` in `config` when the session wants it and it can be
+    /// used. Fails only when it is required and cannot be
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+    fn negotiate_io_uring(
+        &mut self,
+        offered: InitFlags,
+        config: &mut KernelConfig,
+    ) -> io::Result<()> {
+        let mode = self.config.io_uring.mode;
+        if mode == crate::IoUringMode::Disabled {
+            return Ok(());
+        }
+        match io_uring_queues(offered) {
+            Ok(queues) => {
+                #[cfg(target_os = "linux")]
+                {
+                    // Not through add_capabilities(), which refuses it to the filesystem: it is
+                    // the session that has to serve the queues
+                    config.requested |= InitFlags::FUSE_OVER_IO_URING;
+                    self.io_uring = Some(crate::uring::QueueParams {
+                        queues,
+                        depth: self.config.io_uring.queue_depth,
+                        payload_size: crate::uring::QueueParams::payload_size(
+                            config.max_write,
+                            config.max_pages(),
+                        ),
+                        #[cfg(test)]
+                        fail_queue: None,
+                    });
+                }
+                Ok(())
+            }
+            Err(err) if mode == crate::IoUringMode::Required => Err(io::Error::new(
+                err.kind(),
+                format!("FUSE over io_uring is required but unavailable: {err}"),
+            )),
+            Err(err) => {
+                info!("Serving requests over /dev/fuse: {err}");
+                Ok(())
+            }
+        }
+    }
+
+    /// Whether FUSE over io_uring was negotiated with the kernel. If its queues then cannot be
+    /// set up when the session starts running, the session falls back to `/dev/fuse` and logs
+    /// why, unless [`crate::IoUringMode::Required`] makes that an error instead.
+    pub fn io_uring_negotiated(&self) -> bool {
+        self.negotiated.contains(InitFlags::FUSE_OVER_IO_URING)
+    }
+
     /// Unmount the filesystem
     pub fn unmount(&mut self) -> io::Result<()> {
         self.mount.umount()
@@ -536,6 +657,29 @@ impl<FS: Filesystem> Session<FS> {
             self.proto_version,
         )
     }
+}
+
+/// How many io_uring queues the kernel will expect, where FUSE over io_uring can be used
+fn io_uring_queues(offered: InitFlags) -> io::Result<u16> {
+    if !offered.contains(InitFlags::FUSE_OVER_IO_URING) {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "the kernel does not offer FUSE over io_uring (it needs Linux 6.14 or later, \
+             with the fuse module's enable_uring parameter set)",
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    return crate::uring::probe().map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("this process cannot use io_uring: {err}"),
+        )
+    });
+    #[cfg(not(target_os = "linux"))]
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "io_uring is only supported on Linux",
+    ))
 }
 
 #[derive(Debug)]
@@ -723,7 +867,7 @@ impl Drop for BackgroundSession {
 // The abort test uses fusectl, which only exists on Linux; on other targets the
 // whole module would be dead code
 #[cfg(all(test, target_os = "linux"))]
-mod test {
+pub(crate) mod test {
     use std::io::Write;
     use std::mem::ManuallyDrop;
 
@@ -1662,7 +1806,7 @@ mod test {
 
     /// The fusectl abort file for the FUSE mount at `mountpoint`: the connection
     /// directory is named after the mount's anonymous device number.
-    fn fusectl_abort_path(mountpoint: &Path) -> Option<std::path::PathBuf> {
+    pub(crate) fn fusectl_abort_path(mountpoint: &Path) -> Option<std::path::PathBuf> {
         let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
         let mut device = None;
         for line in mountinfo.lines() {
