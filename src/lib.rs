@@ -50,8 +50,6 @@ pub use crate::ll::request::INodeNo;
 pub use crate::ll::request::LockOwner;
 pub use crate::ll::request::Version;
 pub use crate::mnt::mount_options::Config;
-pub use crate::mnt::mount_options::IoUringConfig;
-pub use crate::mnt::mount_options::IoUringMode;
 pub use crate::mnt::mount_options::MountOption;
 pub use crate::notify::Notifier;
 pub use crate::notify::PollHandle;
@@ -107,8 +105,6 @@ mod request;
 mod request_param;
 mod session;
 mod time;
-#[cfg(target_os = "linux")]
-mod uring;
 
 /// We generally support async reads
 #[cfg(not(target_os = "macos"))]
@@ -161,8 +157,7 @@ const UNSUPPORTED_CAPABILITIES: InitFlags = ALIASED_UNSUPPORTED_CAPABILITIES
     // Selecting DAX per inode requires FUSE_ATTR_DAX in the flags field of fuse_attr, which
     // fuser sends as padding. Only a DAX-capable transport (virtiofs) advertises this
     .union(InitFlags::FUSE_HAS_INODE_DAX)
-    // The session negotiates this from `Config::io_uring`, since it is the session that has to
-    // serve the queues the kernel then routes requests to
+    // The kernel would route requests to io_uring queues that fuser never creates
     .union(InitFlags::FUSE_OVER_IO_URING)
     // Announces that the filesystem copes with requests the kernel resends. fuser cannot send
     // the FUSE_NOTIFY_RESEND notification that asks for a resend in the first place
@@ -645,6 +640,15 @@ pub trait Filesystem: Send + Sync + 'static {
     /// Clean up filesystem.
     /// Called on filesystem exit.
     fn destroy(&mut self) {}
+
+    /// Finish work that must complete before acknowledging `FUSE_DESTROY`.
+    ///
+    /// Unlike [`Self::destroy`], this runs before replying to the kernel,
+    /// while a block-backed mount still owns its device. Filesystems can
+    /// publish pending changes here before unmount releases that claim.
+    /// This does not run when the connection aborts without `FUSE_DESTROY`.
+    /// Cleanup still belongs in `destroy`, after the session threads end.
+    fn before_destroy(&self) {}
 
     /// Look up a directory entry by name and get its attributes.
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {

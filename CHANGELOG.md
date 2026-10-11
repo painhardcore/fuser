@@ -1,19 +1,9 @@
 # FUSE for Rust - Changelog
 
 ## Unreleased
-* Add FUSE over io_uring (ABI 7.42, Linux 6.14 and later), selected with `Config::io_uring`.
-  Requests then arrive in buffers the session registers with the kernel, one queue per CPU,
-  each served by a thread of its own, and a reply and the fetch of the next request share one
-  system call. Small requests are answered several times faster than through `/dev/fuse`. It
-  is off by default. `IoUringMode::Auto` uses it where the kernel offers it (the `fuse`
-  module's `enable_uring` parameter has to be set) and the process may use io_uring at all,
-  and serves `/dev/fuse` otherwise; `IoUringMode::Required` fails to mount instead. The
-  filesystem is called from every queue's thread, so a method that blocks for long holds up
-  the other requests from its CPU. A panic in a method called there is answered with `EIO`
-  rather than ending the queue. `Session::io_uring_negotiated()` says whether it was agreed
-* Add `ReplyData::fill()`, which lets a filesystem write the data straight into the reply
-  buffer. Over io_uring that saves copying it once, which for a large read is most of the cost
-  of the reply
+* Remove FUSE over io_uring; requests use `/dev/fuse`. Retain publication before
+  the DESTROY reply and separate name/attribute TTLs for create and readdirplus
+
 * **Breaking:** `Request::uid()` and `Request::gid()` return `Option<u32>`. An idmapped mount
   has no caller ids to report, so there is not always a uid. A filesystem that does not request
   `InitFlags::FUSE_ALLOW_IDMAP` is always given ids and can unwrap
@@ -167,6 +157,9 @@
   requests those operations
 * Remove the `macfuse-4-compat` feature flag, which was set by the build script and selected the
   extended `fuse_rename_in` layout. That layout is now used for all macOS builds
+* Add `ReplyCreate::created_with_ttls()` and `ReplyDirectoryPlus::add_with_ttls()` to reply with
+  distinct entry and attribute TTLs, as `ReplyEntry::entry_with_ttls()` does for lookups. Names
+  learned from `create()` and `readdirplus()` can now outlive their attributes
 
 ## 0.18.0 - 2026-07-22
 * Remove deprecated feature flags `abi-*`

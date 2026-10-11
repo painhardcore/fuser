@@ -38,7 +38,6 @@ use fuser::Filesystem;
 use fuser::FopenFlags;
 use fuser::INodeNo;
 use fuser::InitFlags;
-use fuser::IoUringMode;
 use fuser::KernelConfig;
 use fuser::LockOwner;
 use fuser::MountOption;
@@ -111,25 +110,9 @@ struct Args {
     #[clap(long, default_value_t = 1)]
     n_threads: usize,
 
-    /// Serve requests over io_uring: "auto" falls back to /dev/fuse where the kernel or the
-    /// process cannot use it, "required" fails to mount instead
-    #[clap(long, value_enum, default_value_t = IoUring::Disabled)]
-    io_uring: IoUring,
-
-    /// Requests each io_uring queue holds at once
-    #[clap(long, default_value_t = 8)]
-    io_uring_queue_depth: u16,
-
     /// Sets the level of verbosity
     #[clap(short, action = clap::ArgAction::Count)]
     v: u8,
-}
-
-#[derive(Clone, Copy, clap::ValueEnum)]
-enum IoUring {
-    Disabled,
-    Auto,
-    Required,
 }
 
 const BLOCK_SIZE: u32 = 512;
@@ -3133,12 +3116,6 @@ fn main() {
     }
 
     cfg.n_threads = Some(args.n_threads);
-    cfg.io_uring.mode = match args.io_uring {
-        IoUring::Disabled => IoUringMode::Disabled,
-        IoUring::Auto => IoUringMode::Auto,
-        IoUring::Required => IoUringMode::Required,
-    };
-    cfg.io_uring.queue_depth = args.io_uring_queue_depth;
     let result = fuser::mount(
         SimpleFS::new(args.data_dir, args.direct_io, args.suid, args.idmap),
         &args.mount_point,

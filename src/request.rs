@@ -47,9 +47,6 @@ pub(crate) struct RequestWithSender<'a> {
     /// letting an idmapping that lands on uid 0 pass a check for root. They reach the
     /// filesystem as an `Owner` argument instead, and the caller reads as unknown here
     masked_header: Option<fuse_in_header>,
-    /// Where the reply goes when the request did not arrive on `/dev/fuse`
-    #[cfg(target_os = "linux")]
-    uring: Option<crate::uring::Replier>,
 }
 
 impl<'a> RequestWithSender<'a> {
@@ -81,22 +78,7 @@ impl<'a> RequestWithSender<'a> {
             ch,
             request,
             masked_header,
-            #[cfg(target_os = "linux")]
-            uring: None,
         })
-    }
-
-    /// Create a request that arrived in an io_uring queue entry, which is where its reply goes
-    #[cfg(target_os = "linux")]
-    pub(crate) fn new_uring(
-        ch: ChannelSender,
-        data: &'a [u8],
-        negotiated: InitFlags,
-        replier: crate::uring::Replier,
-    ) -> Option<RequestWithSender<'a>> {
-        let mut request = Self::new(ch, data, negotiated)?;
-        request.uring = Some(replier);
-        Some(request)
     }
 
     /// Dispatch request to the given filesystem.
@@ -363,7 +345,7 @@ impl<'a> RequestWithSender<'a> {
                     x.offset(),
                     ReplyDirectory::new(
                         self.request.unique(),
-                        self.reply_sender(),
+                        ReplySender::Channel(self.ch.clone()),
                         x.size() as usize,
                     ),
                 );
@@ -553,7 +535,7 @@ impl<'a> RequestWithSender<'a> {
                     x.offset(),
                     ReplyDirectoryPlus::new(
                         self.request.unique(),
-                        self.reply_sender(),
+                        ReplySender::Channel(self.ch.clone()),
                         x.size() as usize,
                     ),
                 );
@@ -686,15 +668,7 @@ impl<'a> RequestWithSender<'a> {
     }
 
     pub(crate) fn reply<T: Reply>(&self) -> T {
-        Reply::new(self.request.unique(), self.reply_sender())
-    }
-
-    fn reply_sender(&self) -> ReplySender {
-        #[cfg(target_os = "linux")]
-        if let Some(replier) = &self.uring {
-            return ReplySender::Uring(replier.clone());
-        }
-        ReplySender::Channel(self.ch.clone())
+        Reply::new(self.request.unique(), ReplySender::Channel(self.ch.clone()))
     }
 
     /// Returns a Request reference for this request

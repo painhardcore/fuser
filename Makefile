@@ -27,30 +27,6 @@ xfstests:
 	 --memory=2g --kernel-memory=200m \
 	 -v "$(shell pwd)/logs:/code/logs" fuser:xfstests bash -c "cd /code/fuser && ./xfstests.sh"
 
-# FUSE over io_uring needs the fuse module's enable_uring parameter set on the host, and a
-# seccomp profile that lets the io_uring syscalls through
-IO_URING_SECCOMP = $(shell pwd)/target/io_uring_seccomp.json
-
-io_uring_seccomp:
-	@grep -q Y /sys/module/fuse/parameters/enable_uring || \
-	 (echo "FUSE over io_uring is disabled; enable it with: echo Y | sudo tee /sys/module/fuse/parameters/enable_uring" && exit 1)
-	mkdir -p target
-	tests/io_uring_seccomp.py > $(IO_URING_SECCOMP)
-
-xfstests_io_uring: io_uring_seccomp
-	docker build -t fuser:xfstests -f xfstests.Dockerfile .
-	docker run --rm -$(INTERACTIVE)t --cap-add SYS_ADMIN --cap-add IPC_OWNER --cap-add SYS_PACCT \
-	 --cap-add LINUX_IMMUTABLE --device /dev/fuse --security-opt apparmor:unconfined \
-	 --security-opt seccomp=$(IO_URING_SECCOMP) -e FUSER_EXTRA_ARGS="--io-uring required" \
-	 --memory=2g --kernel-memory=200m \
-	 -v "$(shell pwd)/logs:/code/logs" fuser:xfstests bash -c "cd /code/fuser && ./xfstests.sh"
-
-pjdfs_tests_io_uring: io_uring_seccomp
-	docker build --build-arg BUILD_FEATURES='' -t fuser:pjdfs-pure -f pjdfs.Dockerfile .
-	docker run --rm -$(INTERACTIVE)t --cap-add SYS_ADMIN --device /dev/fuse --security-opt apparmor:unconfined \
-	 --security-opt seccomp=$(IO_URING_SECCOMP) -e FUSER_EXTRA_ARGS="--io-uring required" \
-	 -v "$(shell pwd)/logs:/code/logs" fuser:pjdfs-pure bash -c "cd /code/fuser && ./pjdfs.sh"
-
 pjdfs_tests: pjdfs_tests_fuse2 pjdfs_tests_fuse3 pjdfs_tests_pure
 
 pjdfs_tests_fuse2:
@@ -91,10 +67,6 @@ mount_tests:
 	 -v "$(shell pwd)/docker-cargo-caches/git:/root/.cargo/git" \
 	 -v "$(shell pwd)/docker-cargo-caches/registry:/root/.cargo/registry" \
 	 fuser:mount_tests_libfuse3 bash -c "cd /code/fuser && cargo run -p fuser-tests -- linux-mount-libfuse3"
-
-# FUSE over io_uring is only measured where the fuse module's enable_uring parameter is set
-bench:
-	cargo run --release --example bench
 
 test_passthrough:
 	cargo build --example passthrough --example passthrough_fork
