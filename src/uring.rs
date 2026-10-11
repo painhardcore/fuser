@@ -1047,7 +1047,10 @@ fn assemble(
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct QueueParams {
     pub(crate) queues: u16,
+    /// Entries in each queue, shared out among its threads
     pub(crate) depth: u16,
+    pub(crate) threads_per_queue: u16,
+    pub(crate) pin_threads: bool,
     /// The largest request or reply payload the kernel can exchange with an entry
     pub(crate) payload_size: usize,
     /// A queue whose registration is made to fail
@@ -1075,49 +1078,109 @@ pub(crate) struct Queues {
 }
 
 impl Queues {
-    /// Starts one thread per queue, each serving with one of `loops`, and returns once every
-    /// entry is registered. On failure every queue is stopped again, and the caller has to
-    /// decide whether to fall back to `/dev/fuse`
+    /// Starts `threads_per_queue` threads for each queue, each serving with one of `loops` (all
+    /// of a queue's in turn), and returns once every entry is registered. On failure every
+    /// queue is stopped again, and the caller has to decide whether to fall back to `/dev/fuse`
     pub(crate) fn start<FS: Filesystem>(
         params: QueueParams,
         fuse: &Arc<DevFuse>,
         loops: Vec<SessionEventLoop<FS>>,
     ) -> io::Result<Queues> {
-        debug_assert_eq!(loops.len(), usize::from(params.queues));
+        let threads = params.threads_per_queue;
+        debug_assert_eq!(
+            loops.len(),
+            usize::from(params.queues) * usize::from(threads)
+        );
         let layout = Layout::new(params.payload_size);
-        let (report, reports) = mpsc::channel();
         let mut queues = Queues {
             shared: vec![],
             threads: vec![],
         };
+        // A request that arrives while none of its queue's entries is free waits for one of
+        // them to commit, and an entry registered later does not pick it up. So the kernel is
+        // kept from serving any queue, by keeping the first one empty, until every other
+        // thread has registered. The first queue's threads then register together
+        let (first, rest): (Vec<_>, Vec<_>) = loops
+            .into_iter()
+            .enumerate()
+            .map(|(i, se)| {
+                let qid = (i / usize::from(threads)) as u16;
+                let index = (i % usize::from(threads)) as u16;
+                (qid, index, se)
+            })
+            .partition(|&(qid, _, _)| qid == 0);
+        for (group, gate) in [(rest, None), (first, Some(Arc::new(Gate::default())))] {
+            if let Err(err) = queues.start_group(params, layout, fuse, group, gate) {
+                let _ = queues.stop_and_join_mut();
+                return Err(err);
+            }
+        }
+        Ok(queues)
+    }
+
+    /// Starts a thread for each of `group`, and returns once each has registered. With
+    /// `together`, they wait for each other between setting up and registering
+    fn start_group<FS: Filesystem>(
+        &mut self,
+        params: QueueParams,
+        layout: Layout,
+        fuse: &Arc<DevFuse>,
+        group: Vec<(u16, u16, SessionEventLoop<FS>)>,
+        together: Option<Arc<Gate>>,
+    ) -> io::Result<()> {
+        let threads = params.threads_per_queue;
+        let (report, reports) = mpsc::channel();
         let mut first_error = None;
-        for (qid, se) in loops.into_iter().enumerate() {
-            let qid = qid as u16;
+        let mut spawned_count = 0;
+        for (qid, index, se) in group {
+            // The kernel hands a request to whichever of a queue's entries is waiting, so a
+            // thread busy with a slow request holds back no more than the entries it has
+            let depth = params.depth / threads + u16::from(index < params.depth % threads);
             let fuse = fuse.clone();
             let report = report.clone();
+            let together = together.clone();
             let spawned = thread::Builder::new()
-                .name(format!("fuser-uring-{qid}"))
+                .name(se.thread_name.clone())
                 .spawn(move || {
-                    pin_to_cpu(usize::from(qid));
+                    if params.pin_threads {
+                        pin_to_cpu(usize::from(qid));
+                    }
                     // Every queue reports, or the session would wait for it forever
-                    let queue = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let mut queue =
-                            Queue::new(qid, params.depth, layout, &fuse, se.ch.sender())?;
-                        #[cfg(test)]
-                        if params.fail_queue == Some(qid) {
-                            return Err(io::Error::other("injected failure"));
-                        }
-                        queue.register()?;
-                        Ok(queue)
-                    }))
-                    .unwrap_or_else(|_| Err(io::Error::other("panicked")));
-                    match queue {
-                        Ok(mut queue) => {
-                            let _ = report.send(Ok(queue.shared.clone()));
+                    let catch = |f: &mut dyn FnMut() -> io::Result<()>| {
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+                            .unwrap_or_else(|_| Err(io::Error::other("panicked")))
+                    };
+                    let mut queue = None;
+                    let mut result = catch(&mut || {
+                        queue = Some(Queue::new(qid, depth, layout, &fuse, se.ch.sender())?);
+                        Ok(())
+                    });
+                    // Reached whether or not the setup worked, or the others would wait forever
+                    if let Some(together) = &together {
+                        together.arrive_and_wait();
+                    }
+                    if let (Ok(()), Some(queue)) = (&result, &mut queue) {
+                        result = catch(&mut || {
+                            #[cfg(test)]
+                            if params.fail_queue == Some(qid) {
+                                return Err(io::Error::other("injected failure"));
+                            }
+                            queue.register()
+                        });
+                    }
+                    match (result, queue) {
+                        (Ok(()), Some(mut queue)) => {
+                            let _ = report.send(Ok(Some(queue.shared.clone())));
                             queue.serve(&se);
                             queue.shared.closed.store(true, Ordering::SeqCst);
                         }
-                        Err(err) => {
+                        // The connection can end before every thread has registered
+                        (Err(err), _) if is_disconnected(&err) => {
+                            debug!("io_uring queue {qid}: the connection ended: {err}");
+                            let _ = report.send(Ok(None));
+                        }
+                        (result, _) => {
+                            let err = result.err().unwrap_or_else(|| io::Error::other("no queue"));
                             let _ = report.send(Err(io::Error::new(
                                 err.kind(),
                                 format!("setting up io_uring queue {qid}: {err}"),
@@ -1126,7 +1189,10 @@ impl Queues {
                     }
                 });
             match spawned {
-                Ok(thread) => queues.threads.push(thread),
+                Ok(thread) => {
+                    self.threads.push(thread);
+                    spawned_count += 1;
+                }
                 Err(err) => {
                     first_error = Some(err);
                     break;
@@ -1134,9 +1200,12 @@ impl Queues {
             }
         }
         drop(report);
-        for _ in 0..queues.threads.len() {
+        if let Some(together) = &together {
+            together.open_once_arrived(spawned_count);
+        }
+        for _ in 0..spawned_count {
             match reports.recv() {
-                Ok(Ok(shared)) => queues.shared.push(shared),
+                Ok(Ok(shared)) => self.shared.extend(shared),
                 Ok(Err(err)) => {
                     first_error.get_or_insert(err);
                 }
@@ -1146,13 +1215,7 @@ impl Queues {
                 }
             }
         }
-        match first_error {
-            None => Ok(queues),
-            Some(err) => {
-                let _ = queues.stop_and_join();
-                Err(err)
-            }
-        }
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Stops every queue and waits for their threads. Replies still outstanding are dropped
@@ -1182,6 +1245,43 @@ impl Drop for Queues {
             error!("{err}");
         }
     }
+}
+
+/// Holds threads until all of them have arrived and it is opened
+#[derive(Debug, Default)]
+struct Gate {
+    /// Threads arrived, and whether they may go on
+    state: Mutex<(usize, bool)>,
+    cond: parking_lot::Condvar,
+}
+
+impl Gate {
+    fn arrive_and_wait(&self) {
+        let mut state = self.state.lock();
+        state.0 += 1;
+        self.cond.notify_all();
+        while !state.1 {
+            self.cond.wait(&mut state);
+        }
+    }
+
+    /// Opens once `count` threads have arrived
+    fn open_once_arrived(&self, count: usize) {
+        let mut state = self.state.lock();
+        while state.0 < count {
+            self.cond.wait(&mut state);
+        }
+        state.1 = true;
+        self.cond.notify_all();
+    }
+}
+
+/// What registering an entry fails with once the connection has ended
+fn is_disconnected(err: &io::Error) -> bool {
+    matches!(
+        err.raw_os_error(),
+        Some(libc::ENOTCONN | libc::ECONNABORTED | libc::ENODEV)
+    )
 }
 
 /// Serves the queue of a CPU from that CPU, where the process may run there

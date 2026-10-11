@@ -29,6 +29,7 @@ use crate::Filesystem;
 use crate::FopenFlags;
 use crate::Generation;
 use crate::INodeNo;
+use crate::IoUringConfig;
 use crate::IoUringMode;
 use crate::LockOwner;
 use crate::OpenFlags;
@@ -48,6 +49,8 @@ const SLOW: INodeNo = INodeNo(3);
 const PANIC: INodeNo = INodeNo(4);
 /// Its getattr reply is kept until something else answers it
 const HELD: INodeNo = INodeNo(5);
+/// Its getattr blocks until the gate opens
+const BLOCKED: INodeNo = INodeNo(6);
 const FILE_SIZE: u64 = 4 << 20;
 
 /// What a byte at `pos` of `FILE` holds
@@ -102,6 +105,9 @@ struct State {
     bytes_written: AtomicU64,
     held: StdMutex<Option<ReplyAttr>>,
     held_cond: Condvar,
+    /// Whether a getattr of `BLOCKED` has started, and whether it may finish
+    gate: StdMutex<(bool, bool)>,
+    gate_cond: Condvar,
 }
 
 struct TestFs(Arc<State>);
@@ -121,6 +127,7 @@ impl Filesystem for TestFs {
             Some("slow") => SLOW,
             Some("panic") => PANIC,
             Some("held") => HELD,
+            Some("blocked") => BLOCKED,
             _ => return reply.error(Errno::ENOENT),
         };
         reply.entry(
@@ -149,6 +156,15 @@ impl Filesystem for TestFs {
             HELD => {
                 *self.0.held.lock().unwrap() = Some(reply);
                 self.0.held_cond.notify_all();
+            }
+            BLOCKED => {
+                let mut gate = self.0.gate.lock().unwrap();
+                gate.0 = true;
+                self.0.gate_cond.notify_all();
+                while !gate.1 {
+                    gate = self.0.gate_cond.wait(gate).unwrap();
+                }
+                reply.attr(&Duration::ZERO, &attr);
             }
             _ => {
                 // Answering a reply kept from an earlier request comes first, so that it is
@@ -245,12 +261,28 @@ struct Mounted {
 
 impl Mounted {
     fn new(mode: IoUringMode, fail_queue: Option<u16>) -> io::Result<Self> {
+        let defaults = IoUringConfig::default();
+        Self::with_queues(
+            mode,
+            fail_queue,
+            defaults.queue_depth,
+            defaults.threads_per_queue,
+        )
+    }
+
+    fn with_queues(
+        mode: IoUringMode,
+        fail_queue: Option<u16>,
+        queue_depth: u16,
+        threads_per_queue: u16,
+    ) -> io::Result<Self> {
         let state = Arc::new(State::default());
         let tmp = ManuallyDrop::new(tempfile::tempdir().unwrap());
         let mountpoint = tmp.path().canonicalize().unwrap();
         let mut config = Config::default();
         config.io_uring.mode = mode;
-        config.io_uring.queue_depth = 4;
+        config.io_uring.queue_depth = queue_depth;
+        config.io_uring.threads_per_queue = threads_per_queue;
         let mut session = Session::new(TestFs(state.clone()), &mountpoint, &config)?;
         if let Some(params) = &mut session.io_uring {
             params.fail_queue = fail_queue;
@@ -347,7 +379,9 @@ fn serves_requests_from_every_cpu() {
             "served over /dev/fuse: {served_by:?}"
         );
         assert!(
-            served_by.contains(&format!("fuser-uring-{cpu}")),
+            served_by
+                .iter()
+                .any(|name| name.starts_with(&format!("fuser-uring-{cpu}-"))),
             "nothing from CPU {cpu} reached its queue: {served_by:?}"
         );
     }
@@ -382,13 +416,15 @@ fn replies_from_other_threads() {
     mounted.unmount().unwrap();
 }
 
-/// A reply kept by the filesystem and sent while a later request on the same queue is served
+/// A reply kept by the filesystem and sent while a later request on the same queue is served,
+/// by the same thread
 #[test]
 fn reply_held_over_to_a_later_request() {
     if !uring_usable() {
         return;
     }
-    let mounted = Mounted::new(IoUringMode::Required, None).unwrap();
+    // The held request keeps one entry, and the thread has another for the next request
+    let mounted = Mounted::with_queues(IoUringMode::Required, None, 2, 1).unwrap();
     let cpu = allowed_cpus()[0];
     let held = mounted.path("held");
     let waiter = thread::spawn(move || {
@@ -404,6 +440,47 @@ fn reply_held_over_to_a_later_request() {
     let file = mounted.path("file");
     on_cpu(cpu, move || std::fs::metadata(file).unwrap());
     assert_eq!(waiter.join().unwrap().unwrap(), FILE_SIZE);
+    mounted.unmount().unwrap();
+}
+
+/// A filesystem method that blocks holds up no other request from its CPU while the queue has
+/// another thread
+#[test]
+fn blocked_method_holds_up_no_other_request() {
+    if !uring_usable() {
+        return;
+    }
+    let mounted = Mounted::with_queues(IoUringMode::Required, None, 2, 2).unwrap();
+    let cpu = allowed_cpus()[0];
+    let blocked = mounted.path("blocked");
+    let blocked = thread::spawn(move || {
+        super::pin_to_cpu(cpu);
+        std::fs::metadata(blocked).map(|m| m.len())
+    });
+    {
+        let mut gate = mounted.state.gate.lock().unwrap();
+        while !gate.0 {
+            gate = mounted.state.gate_cond.wait(gate).unwrap();
+        }
+    }
+    let (done, finished) = std::sync::mpsc::channel();
+    let file = mounted.path("file");
+    thread::spawn(move || {
+        super::pin_to_cpu(cpu);
+        let _ = done.send(std::fs::metadata(file).map(|m| m.len()));
+    });
+    let unblocked = finished.recv_timeout(Duration::from_secs(10));
+    let mut gate = mounted.state.gate.lock().unwrap();
+    gate.1 = true;
+    mounted.state.gate_cond.notify_all();
+    drop(gate);
+    assert_eq!(
+        unblocked
+            .expect("a request waited behind a blocked one")
+            .unwrap(),
+        FILE_SIZE
+    );
+    assert_eq!(blocked.join().unwrap().unwrap(), FILE_SIZE);
     mounted.unmount().unwrap();
 }
 

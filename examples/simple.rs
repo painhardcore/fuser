@@ -117,8 +117,12 @@ struct Args {
     io_uring: IoUring,
 
     /// Requests each io_uring queue holds at once
-    #[clap(long, default_value_t = 8)]
+    #[clap(long, default_value_t = 4)]
     io_uring_queue_depth: u16,
+
+    /// Threads serving each io_uring queue
+    #[clap(long, default_value_t = 4)]
+    io_uring_threads_per_queue: u16,
 
     /// Sets the level of verbosity
     #[clap(short, action = clap::ArgAction::Count)]
@@ -3139,6 +3143,7 @@ fn main() {
         IoUring::Required => IoUringMode::Required,
     };
     cfg.io_uring.queue_depth = args.io_uring_queue_depth;
+    cfg.io_uring.threads_per_queue = args.io_uring_threads_per_queue;
     let result = fuser::mount(
         SimpleFS::new(args.data_dir, args.direct_io, args.suid, args.idmap),
         &args.mount_point,
