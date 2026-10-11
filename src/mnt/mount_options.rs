@@ -42,10 +42,12 @@ pub enum IoUringMode {
 /// How a session uses FUSE over io_uring
 ///
 /// The kernel has one queue per possible CPU and hands each request to the queue of the CPU it
-/// was issued on. A session serving it runs one thread per queue, pinned to that CPU where the
-/// process may run there, and the filesystem is called from those threads. Requests issued on
-/// a CPU are served one at a time while its thread is busy, so a filesystem method that blocks
-/// for long delays every other request from that CPU; replying from another thread avoids that.
+/// was issued on. A session serves each queue with `threads_per_queue` threads, pinned to that
+/// CPU where the process may run there, and the filesystem is called from those threads. A
+/// thread busy in a filesystem method serves nothing else, so with a single thread a method
+/// that blocks for long delays every other request from that CPU. That includes requests the
+/// caller does not wait for, such as `release()` after `close(2)`: the caller's next request
+/// then waits behind it. More threads per queue, or replying from another thread, avoid that.
 ///
 /// Every queue entry holds a buffer the size of the largest request, which is
 /// `KernelConfig::set_max_write()` (16 MiB unless lowered) or the readahead size, whichever is
@@ -60,6 +62,16 @@ pub struct IoUringConfig {
     pub mode: IoUringMode,
     /// Requests each queue can hold at once, from 1 to 1024
     pub queue_depth: u16,
+    /// Threads serving each queue, from 1 to `queue_depth`. They share out its entries. A
+    /// thread with one entry takes a request only when it is free, so where filesystem methods
+    /// block, an entry per thread keeps one slow request from holding up others. Entries
+    /// beyond that help a filesystem that replies from other threads, letting each thread
+    /// take more requests while earlier ones are still being answered
+    pub threads_per_queue: u16,
+    /// Whether to pin each queue's threads to the queue's CPU. Pinned, a request is served on
+    /// the CPU that issued it, which saves moving it between CPUs but has the filesystem
+    /// share that CPU with the caller. Unpinned, the scheduler places the threads
+    pub pin_threads: bool,
 }
 
 impl IoUringConfig {
@@ -71,7 +83,9 @@ impl Default for IoUringConfig {
     fn default() -> Self {
         Self {
             mode: IoUringMode::Disabled,
-            queue_depth: 8,
+            queue_depth: 4,
+            threads_per_queue: 4,
+            pin_threads: true,
         }
     }
 }
@@ -199,6 +213,17 @@ pub(crate) fn check_io_uring(config: &IoUringConfig) -> Result<(), io::Error> {
                 "io_uring queue_depth must be from 1 to {}, got {}",
                 IoUringConfig::MAX_QUEUE_DEPTH,
                 config.queue_depth
+            ),
+        ));
+    }
+    if config.mode != IoUringMode::Disabled
+        && !(1..=config.queue_depth).contains(&config.threads_per_queue)
+    {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "io_uring threads_per_queue must be from 1 to queue_depth ({}), got {}",
+                config.queue_depth, config.threads_per_queue
             ),
         ));
     }

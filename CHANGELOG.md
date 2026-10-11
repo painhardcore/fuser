@@ -3,14 +3,14 @@
 ## Unreleased
 * Add FUSE over io_uring (ABI 7.42, Linux 6.14 and later), selected with `Config::io_uring`.
   Requests then arrive in buffers the session registers with the kernel, one queue per CPU,
-  each served by a thread of its own, and a reply and the fetch of the next request share one
-  system call. Small requests are answered several times faster than through `/dev/fuse`. It
-  is off by default. `IoUringMode::Auto` uses it where the kernel offers it (the `fuse`
+  and a reply and the fetch of the next request share one system call. It is off by default. `IoUringMode::Auto` uses it where the kernel offers it (the `fuse`
   module's `enable_uring` parameter has to be set) and the process may use io_uring at all,
   and serves `/dev/fuse` otherwise; `IoUringMode::Required` fails to mount instead. The
-  filesystem is called from every queue's thread, so a method that blocks for long holds up
-  the other requests from its CPU. A panic in a method called there is answered with `EIO`
-  rather than ending the queue. `Session::io_uring_negotiated()` says whether it was agreed
+  filesystem is called from every queue's threads: `IoUringConfig::threads_per_queue` of them
+  (4 by default), so that one slow method, such as a `release()` the caller did not wait for,
+  holds up nothing else from its CPU, pinned there unless `IoUringConfig::pin_threads` is
+  turned off. A panic in a method called there is answered with `EIO` rather than ending the
+  queue. `Session::io_uring_negotiated()` says whether it was agreed
 * Add `ReplyData::fill()`, which lets a filesystem write the data straight into the reply
   buffer. Over io_uring that saves copying it once, which for a large read is most of the cost
   of the reply

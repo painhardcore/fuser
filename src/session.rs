@@ -311,9 +311,15 @@ impl<FS: Filesystem> Session<FS> {
         let queues = match io_uring {
             None => None,
             Some(params) => {
+                let threads = params.threads_per_queue;
                 let loops = (0..params.queues)
-                    .map(|qid| SessionEventLoop {
-                        thread_name: format!("fuser-uring-{qid}"),
+                    .flat_map(|qid| (0..threads).map(move |thread| (qid, thread)))
+                    .map(|(qid, thread)| SessionEventLoop {
+                        thread_name: if threads == 1 {
+                            format!("fuser-uring-{qid}")
+                        } else {
+                            format!("fuser-uring-{qid}-{thread}")
+                        },
                         filesystem: filesystem.clone(),
                         ch: ch.clone(),
                         allowed,
@@ -326,8 +332,8 @@ impl<FS: Filesystem> Session<FS> {
                 match crate::uring::Queues::start(params, &ch.device(), loops) {
                     Ok(queues) => {
                         info!(
-                            "Serving requests over io_uring: {} queues of depth {}",
-                            params.queues, params.depth
+                            "Serving requests over io_uring: {} queues of depth {}, {} threads each",
+                            params.queues, params.depth, params.threads_per_queue
                         );
                         Some(queues)
                     }
@@ -609,6 +615,8 @@ impl<FS: Filesystem> Session<FS> {
                     self.io_uring = Some(crate::uring::QueueParams {
                         queues,
                         depth: self.config.io_uring.queue_depth,
+                        threads_per_queue: self.config.io_uring.threads_per_queue,
+                        pin_threads: self.config.io_uring.pin_threads,
                         payload_size: crate::uring::QueueParams::payload_size(
                             config.max_write,
                             config.max_pages(),

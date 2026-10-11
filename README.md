@@ -119,7 +119,7 @@ To create a new filesystem, implement the trait `fuser::Filesystem`. See the [do
 
 On Linux 6.14 and later, a session can exchange requests with the kernel over io_uring instead
 of `read(2)` and `writev(2)` on `/dev/fuse`. The kernel keeps one queue per CPU, the session
-serves each from a thread pinned to that CPU, and replying to a request and fetching the next
+serves each with threads pinned to that CPU, and replying to a request and fetching the next
 take one system call. The `Filesystem` trait is unchanged.
 
 ```rust
@@ -140,9 +140,19 @@ leaves the session on `/dev/fuse`, saying why in the log.
 
 Things to know:
 
-* The filesystem is called from every queue's thread at once, so it must cope with concurrent
-  calls, as it already must with `Config::n_threads`. A method that blocks for long holds up
-  the other requests issued on its CPU; replying from another thread avoids that.
+* The filesystem is called from every queue's threads at once, so it must cope with concurrent
+  calls, as it already must with `Config::n_threads`.
+* Each queue is served by `threads_per_queue` threads (4 by default), each holding one of the
+  queue's `queue_depth` entries. A thread busy in a slow method then holds up nothing else from
+  its CPU. That matters for requests the caller does not wait for: `close(2)` returns before
+  `release()` is answered, and the caller's next request would otherwise queue behind it.
+* With `pin_threads` (the default) a request is served on the CPU that issued it. For a single
+  caller most of the gain below comes from that placement rather than from the transport: in
+  the same VM, unpinned io_uring serves one caller about as fast as `/dev/fuse`. On hardware
+  whose clock follows load, the placement can instead show up as a higher clock, and the
+  filesystem's work competes with the caller for its CPU. What placement does not explain is
+  the gain with many callers, where `/dev/fuse` funnels every request through one contended
+  queue; a filesystem that serializes its requests behind one lock cannot use that.
 * Each queue entry reserves a buffer of `max_write` (16 MiB unless lowered with
   `KernelConfig::set_max_write()`), which only takes memory as large requests pass through it.
 * `ReplyData::fill()` writes a read's data straight into the buffer the kernel copies it from,
@@ -152,24 +162,29 @@ Things to know:
 
 `make bench` compares the transports (`examples/bench.rs`). On a 4-CPU VM running Linux 6.18,
 with every request reaching the filesystem (direct I/O, no attribute caching), reads served from
-`/dev/shm` with `ReplyData::fill()` and writes discarded, 4 clients in the parallel rows:
+`/dev/shm` with `ReplyData::fill()`, writes discarded, files created and listed in memory and
+4 clients in the parallel rows:
 
 | workload | `/dev/fuse`, 1 thread | `/dev/fuse`, 4 threads | io_uring |
 |---|---|---|---|
-| stat, 1 client | 17.5k ops/s | 16.4k ops/s | 40.2k ops/s |
-| stat, 4 clients | 48.6k ops/s | 66.6k ops/s | 368k ops/s |
-| read 4k, 1 client | 133 MiB/s | 127 MiB/s | 287 MiB/s |
-| read 4k, 4 clients | 363 MiB/s | 500 MiB/s | 2934 MiB/s |
-| write 4k, 1 client | 130 MiB/s | 139 MiB/s | 471 MiB/s |
-| read 128k, 1 client | 2473 MiB/s | 2140 MiB/s | 3573 MiB/s |
-| write 128k, 1 client | 2706 MiB/s | 2628 MiB/s | 4525 MiB/s |
-| read 1M, 1 client | 3549 MiB/s | 1962 MiB/s | 2110 MiB/s |
-| read 1M, 4 clients | 4339 MiB/s | 13520 MiB/s | 15725 MiB/s |
-| write 1M, 1 client | 3516 MiB/s | 2883 MiB/s | 2933 MiB/s |
+| stat, 1 client | 17.0k ops/s | 16.2k ops/s | 39.1k ops/s |
+| stat, 4 clients | 49.6k ops/s | 68.5k ops/s | 387k ops/s |
+| read 4k, 1 client | 136 MiB/s | 113 MiB/s | 282 MiB/s |
+| read 4k, 4 clients | 342 MiB/s | 463 MiB/s | 2759 MiB/s |
+| write 4k, 1 client | 133 MiB/s | 127 MiB/s | 583 MiB/s |
+| read 128k, 1 client | 2633 MiB/s | 1520 MiB/s | 3203 MiB/s |
+| write 128k, 1 client | 2795 MiB/s | 2502 MiB/s | 3877 MiB/s |
+| read 1M, 1 client | 3417 MiB/s | 2377 MiB/s | 2052 MiB/s |
+| read 1M, 4 clients | 4080 MiB/s | 14612 MiB/s | 17267 MiB/s |
+| write 1M, 1 client | 3985 MiB/s | 2571 MiB/s | 3227 MiB/s |
+| create 4k file, 1 client | 6.4k files/s | 5.7k files/s | 18.1k files/s |
+| create 4k file, 4 clients | 18.9k files/s | 22.9k files/s | 70.3k files/s |
+| list 1000 entries, 1 client | 3.5k lists/s | 2.5k lists/s | 6.1k lists/s |
 
-Median latency of a 4k read drops from about 27us to 5-10us. The one case that loses is a
-single client streaming large requests, where serving them on the client's own CPU costs more
-than it saves.
+A single client streaming large requests loses, since serving them on its own CPU costs more
+than it saves. `--slow release --delay-us 100` makes `release()` sleep, as one doing I/O would:
+with one thread per queue, creating 4k files then drops to 3.5k files/s against 5.6k over
+`/dev/fuse` with 4 threads; with the default four it reaches 11.3k.
 
 ## To Do
 
