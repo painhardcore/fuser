@@ -586,6 +586,8 @@ struct SimpleFS {
     killpriv_negotiated: bool,
     /// Whether the mount may be idmapped, and so whether it has a caller to check at all
     idmapped: bool,
+    /// Held while the next inode number is taken, which is a read and a write of the superblock
+    inode_allocation: std::sync::Mutex<()>,
 }
 
 impl SimpleFS {
@@ -598,7 +600,20 @@ impl SimpleFS {
             killpriv_negotiated: false,
             // Not settled until init(), where the kernel says whether it offers the capability
             idmapped: idmap,
+            inode_allocation: std::sync::Mutex::new(()),
         }
+    }
+
+    /// Replaces a metadata file whole. Requests can be served from several threads at once, and
+    /// one that reads the file while it is being rewritten in place would find it truncated
+    fn replace_file(path: &Path, write: impl FnOnce(&mut File)) {
+        static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+        let mut temp = path.as_os_str().to_owned();
+        temp.push(format!(".tmp{}", NEXT_TEMP.fetch_add(1, Ordering::Relaxed)));
+        let mut file = File::create(&temp).unwrap();
+        write(&mut file);
+        drop(file);
+        fs::rename(&temp, path).unwrap();
     }
 
     fn creation_mode(&self, mode: u32) -> u16 {
@@ -610,19 +625,16 @@ impl SimpleFS {
     }
 
     fn allocate_next_inode(&self) -> INodeNo {
+        let _allocating = self.inode_allocation.lock().unwrap();
         let path = Path::new(&self.data_dir).join("superblock");
         let current_inode = match File::open(&path) {
             Ok(file) => INodeNo(rmp_serde::from_read(file).unwrap()),
             _ => INodeNo::ROOT,
         };
 
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .unwrap();
-        rmp_serde::encode::write(&mut file, &(current_inode.0 + 1)).unwrap();
+        Self::replace_file(&path, |file| {
+            rmp_serde::encode::write(file, &(current_inode.0 + 1)).unwrap();
+        });
 
         INodeNo(current_inode.0 + 1)
     }
@@ -709,13 +721,9 @@ impl SimpleFS {
         let path = Path::new(&self.data_dir)
             .join("contents")
             .join(inode.to_string());
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)
-            .unwrap();
-        rmp_serde::encode::write(&mut file, &entries).unwrap();
+        Self::replace_file(&path, |file| {
+            rmp_serde::encode::write(file, &entries).unwrap();
+        });
     }
 
     fn get_inode(&self, inode: INodeNo) -> Result<InodeAttributes, Errno> {
@@ -766,13 +774,9 @@ impl SimpleFS {
         let path = Path::new(&self.data_dir)
             .join("inodes")
             .join(inode.inode.to_string());
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)
-            .unwrap();
-        rmp_serde::encode::write(&mut file, inode).unwrap();
+        Self::replace_file(&path, |file| {
+            rmp_serde::encode::write(file, inode).unwrap();
+        });
     }
 
     /// Drops one open handle and reclaims the inode if that was the last thing keeping it.
